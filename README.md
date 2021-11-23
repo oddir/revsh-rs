@@ -2,10 +2,10 @@
 
 PoC reimplementation of [revsh](https://github.com/emptymonkey/revsh) control part in async Rust. Many features missing. Only basic shell (no tty) and socks4 proxy working. Still learning Rust :3
 
-Convert revsh keys:
+First go revsh keys dir and convert keys to pfx with no export password:
 
 ```
-openssl pkcs12 -export -out identity.pfx -inkey key.pem -in cert.pem
+openssl pkcs12 -export -out identity.pfx -inkey control_key.pem -in control_cert.pem
 ```
 
 Build project linking with same OpenSSL as the revsh target:
