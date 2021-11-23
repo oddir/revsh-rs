@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
     let listen_addr = matches.value_of("listen-addr").context("error")?;
 
     // start listener
+    println!("starting listener");
     let mut control = Control::new(listen_addr.parse()?, keyfile)
         .await?
         .shell("/bin/sh".to_string())
@@ -43,11 +44,13 @@ async fn main() -> Result<()> {
         .proxy(proxy_addr);
 
     // accept
+    println!("waiting client");
     while let Err(e) = control.accept().await {
         println!("accept failed: {}", e);
     }
 
     // run broker
+    println!("run broker");
     control.broker().await?;
 
     Ok(())
