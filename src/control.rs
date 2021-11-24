@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -15,6 +15,7 @@ use crate::broker::Broker;
 use crate::message::{DataType, Message};
 
 pub struct Control {
+    message_data_size: u16,
     shell: String,
     env: Vec<String>,
     term_width: u16,
@@ -41,7 +42,8 @@ impl Control {
 
         let acceptor = TokioTlsAcceptor::from(acceptor);
 
-        Ok(Control {
+        Ok(Self {
+            message_data_size: u16::MAX,
             shell: "/bin/sh".to_string(),
             env: vec!["PATH=/bin:/usr/bin/".to_string()],
             proxy_addr: None,
@@ -151,13 +153,24 @@ impl Control {
 
         println!("proto {}.{}", proto_major, proto_minor);
 
-        // send data size
-        stream.write(&u16::to_be_bytes(4096)).await?;
+        // send desired data size
+        stream
+            .write(&u16::to_be_bytes(self.message_data_size))
+            .await?;
 
-        // recv data size
+        // recv desired data size
         stream.read_exact(&mut buf).await?;
         let data_size = u16::from_be_bytes(buf);
-        println!("data size {}", data_size);
+
+        if data_size < 1024 {
+            bail!("Can't agree on a message size");
+        }
+
+        if data_size < self.message_data_size {
+            self.message_data_size = data_size;
+        }
+
+        println!("data size {}", self.message_data_size);
 
         Ok(())
     }

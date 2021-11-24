@@ -147,7 +147,7 @@ impl Broker {
 
         let connection_string = format!("{}:{}", dst_ip, dst_port);
 
-        Broker::connection_create(writer.clone(), id, &connection_string).await?;
+        Self::connection_create(writer.clone(), id, &connection_string).await?;
 
         stream.write(&u8::to_be_bytes(0)).await?;
         stream.write(&u8::to_be_bytes(90)).await?;
@@ -166,7 +166,7 @@ impl Broker {
             );
         }
 
-        tokio::spawn(Broker::proxy_reader(
+        tokio::spawn(Self::proxy_reader(
             r,
             id,
             proxy_connections.clone(),
@@ -191,7 +191,7 @@ impl Broker {
                             if n < 1 {
                                 break;
                             }
-                            Broker::connection_data(remote_writer.clone(), id, &buf[..n]).await?;
+                            Self::connection_data(remote_writer.clone(), id, &buf[..n]).await?;
                         }
                         _ => break,
                     }
@@ -231,8 +231,8 @@ impl Broker {
         }
     }
 
-    pub fn new() -> Result<Broker> {
-        Ok(Broker {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
             proxy_addr: None,
             reader: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),

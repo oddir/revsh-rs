@@ -150,8 +150,8 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn new() -> Message {
-        Message {
+    pub fn new() -> Self {
+        Self {
             data_type: DataType::Unknown,
             data: vec![],
             header_type: 0,
@@ -247,7 +247,7 @@ impl Message {
         let mut stream = stream.lock().await;
         let stream = stream.as_mut().context("error")?;
 
-        let mut message = Message::new();
+        let mut message = Self::new();
 
         let mut buf = [0u8; 2];
         stream.read_exact(&mut buf).await?;
