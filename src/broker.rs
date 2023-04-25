@@ -1,80 +1,126 @@
 use anyhow::{bail, Context, Result};
+use log::debug;
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+#[allow(unused)]
+use std::sync::{atomic::Ordering, Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_native_tls::TlsStream;
 
+use crate::control::Control;
 use crate::message::{ConnectionHeaderType, DataType, Message, ProxyHeaderType, ProxyType};
+#[cfg(feature = "tty")]
+use crate::tty::{Tty, UPDATE_WINSIZE};
 
 type TlsReader = Arc<Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>>;
 type TlsWriter = Arc<Mutex<Option<WriteHalf<TlsStream<TcpStream>>>>>;
-type StreamWriter = Arc<Mutex<Option<WriteHalf<TcpStream>>>>;
+type TcpWriter = Arc<Mutex<Option<WriteHalf<TcpStream>>>>;
 type ProxyConnections = Arc<Mutex<HashMap<u16, ProxyConnection>>>;
 
 pub struct Broker {
-    proxy_addr: Option<SocketAddr>,
+    pub remote_address: SocketAddr,
     reader: TlsReader,
     writer: TlsWriter,
+    proxy_address: Option<SocketAddr>,
     proxy_connections: ProxyConnections,
+    #[cfg(feature = "tty")]
+    tty: Option<Tty>,
 }
 
 pub struct ProxyConnection {
-    writer: StreamWriter,
+    writer: TcpWriter,
 }
 
 impl Broker {
+    pub async fn new(control: &mut Control, remote_address: SocketAddr) -> Result<Self> {
+        let stream = control.stream.lock().await.take().context("error")?;
+        let (r, w) = tokio::io::split(stream);
+        Ok(Self {
+            remote_address,
+            reader: Arc::new(Mutex::new(Some(r))),
+            writer: Arc::new(Mutex::new(Some(w))),
+            proxy_address: control.proxy_address,
+            proxy_connections: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "tty")]
+            tty: None,
+        })
+    }
+    #[cfg(feature = "tty")]
+    pub fn tty<'a>(&'a mut self) -> &'a mut Self {
+        self.tty = Some(Tty::new());
+        self
+    }
+
     async fn message_handler(
         mut reader: TlsReader,
+        #[allow(unused_mut)] mut _writer: TlsWriter,
         proxy_connections: ProxyConnections,
+        #[cfg(feature = "tty")] _tty: Option<Tty>,
     ) -> Result<()> {
+        let mut stdout = tokio::io::stdout();
+        let mut stderr = tokio::io::stderr();
         loop {
             let message = Message::pull(&mut reader).await?;
             match message.data_type {
                 DataType::Tty => {
-                    let s = std::str::from_utf8(&message.data)?;
-                    print!("{}", s);
-                    std::io::stdout().flush()?;
+                    stdout.write_all(&message.data).await?;
+                    stdout.flush().await?;
                 }
                 DataType::Error => {
-                    //let s = std::str::from_utf8(&message.data)?;
-                    //print!("{}", s);
-                    //std::io::stdout().flush()?;
+                    stderr.write_all(&message.data).await?;
+                    stderr.write_all(b"\r\n").await?;
+                    stderr.flush().await?;
                 }
                 DataType::Connection => {
                     let id = message.header_id;
                     let mut proxy_connections = proxy_connections.lock().await;
                     if let Some(proxy_connection) = proxy_connections.get(&id) {
-                        if message.data.len() < 1 {
+                        if message.data.is_empty() {
                             proxy_connections.remove(&id);
                         } else {
                             let mut writer = proxy_connection.writer.lock().await;
                             let writer = writer.as_mut().context("error")?;
-                            writer.write(&message.data).await?;
+                            writer.write_all(&message.data).await?;
                         }
                     }
                 }
                 _ => {
-                    //dbg!(message);
+                    debug!("Unknown message: {:?}", message);
                 }
+            }
+
+            #[cfg(feature = "tty")]
+            if UPDATE_WINSIZE.load(Ordering::Relaxed) {
+                debug!("Updating winsize");
+                let tty_winsize = Tty::get_winsize();
+                let mut data = Vec::new();
+                data.extend(u16::to_be_bytes(tty_winsize.ws_row));
+                data.extend(u16::to_be_bytes(tty_winsize.ws_col));
+                Message::new()
+                    .data_type(DataType::Winresize)
+                    .data(data)
+                    .push(&mut _writer)
+                    .await?;
+                UPDATE_WINSIZE.store(false, Ordering::Relaxed);
             }
         }
     }
 
-    pub async fn stdin_handler(&mut self) -> Result<()> {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let line = line? + "\n";
+    pub async fn stdin_handler(mut writer: TlsWriter) -> Result<()> {
+        // https://github.com/tokio-rs/tokio/issues/2466
+        let mut stdin = tokio_fd::AsyncFd::try_from(libc::STDIN_FILENO)?;
+
+        let mut buf = [0u8; 1024];
+        loop {
+            let bytes_read = stdin.read(&mut buf).await?;
             Message::new()
                 .data_type(DataType::Tty)
-                .data(line.as_bytes().to_vec())
-                .push(&mut self.writer)
+                .data(buf[..bytes_read].to_vec())
+                .push(&mut writer)
                 .await?;
         }
-        Ok(())
     }
 
     pub async fn proxy_create(mut writer: TlsWriter, proxy_string: &str) -> Result<()> {
@@ -149,10 +195,10 @@ impl Broker {
 
         Self::connection_create(writer.clone(), id, &connection_string).await?;
 
-        stream.write(&u8::to_be_bytes(0)).await?;
-        stream.write(&u8::to_be_bytes(90)).await?;
-        stream.write(&u16::to_be_bytes(dst_port)).await?;
-        stream.write(&dst_ip.octets()).await?;
+        stream.write_all(&u8::to_be_bytes(0)).await?;
+        stream.write_all(&u8::to_be_bytes(90)).await?;
+        stream.write_all(&u16::to_be_bytes(dst_port)).await?;
+        stream.write_all(&dst_ip.octets()).await?;
 
         let (r, w) = tokio::io::split(stream);
 
@@ -198,7 +244,7 @@ impl Broker {
                 },
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
                     let proxy_connections = proxy_connections.lock().await;
-                    if let None = proxy_connections.get(&id) {
+                    if proxy_connections.get(&id).is_none() {
                         break;
                     }
                 },
@@ -210,65 +256,57 @@ impl Broker {
     }
 
     pub async fn proxy_listener(
-        listen_addr: String,
+        listen_address: String,
         proxy_connections: ProxyConnections,
         writer: TlsWriter,
     ) -> Result<()> {
-        let listener = TcpListener::bind(listen_addr).await?;
+        let listener = TcpListener::bind(listen_address).await?;
 
         loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    tokio::spawn(Self::proxy_handler(
-                        stream,
-                        proxy_connections.clone(),
-                        addr.port(),
-                        writer.clone(),
-                    ));
-                }
-                Err(_) => {}
+            if let Ok((stream, address)) = listener.accept().await {
+                tokio::spawn(Self::proxy_handler(
+                    stream,
+                    proxy_connections.clone(),
+                    address.port(),
+                    writer.clone(),
+                ));
             }
         }
     }
 
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            proxy_addr: None,
-            reader: Arc::new(Mutex::new(None)),
-            writer: Arc::new(Mutex::new(None)),
-            proxy_connections: Arc::new(Mutex::new(HashMap::new())),
-        })
-    }
-
-    pub fn proxy(mut self, proxy_addr: Option<SocketAddr>) -> Self {
-        self.proxy_addr = proxy_addr;
-        self
-    }
-
-    pub async fn run(&mut self, stream: Arc<Mutex<Option<TlsStream<TcpStream>>>>) -> Result<()> {
-        let stream = stream.lock().await.take().context("error")?;
-        let (r, w) = tokio::io::split(stream);
-        self.writer = Arc::new(Mutex::new(Some(w)));
-        self.reader = Arc::new(Mutex::new(Some(r)));
-        if let Some(proxy_addr) = self.proxy_addr {
+    pub async fn run(self) -> Result<()> {
+        if let Some(proxy_address) = self.proxy_address {
             Self::proxy_create(
                 self.writer.clone(),
-                &format!("{}:127.0.0.1:1081", proxy_addr.port()),
+                &format!("{}:127.0.0.1:1081", proxy_address.port()),
             )
             .await?;
         }
-        tokio::spawn(Self::message_handler(
+        let message_handler = tokio::spawn(Self::message_handler(
             self.reader.clone(),
+            self.writer.clone(),
             self.proxy_connections.clone(),
+            #[cfg(feature = "tty")]
+            self.tty,
         ));
-        if let Some(proxy_addr) = self.proxy_addr {
+        if let Some(proxy_address) = self.proxy_address {
             tokio::spawn(Self::proxy_listener(
-                format!("{}:{}", proxy_addr.ip(), proxy_addr.port()),
+                format!("{}:{}", proxy_address.ip(), proxy_address.port()),
                 self.proxy_connections.clone(),
                 self.writer.clone(),
             ));
         }
-        self.stdin_handler().await?;
+        let stdin_handler = tokio::spawn(Self::stdin_handler(self.writer));
+
+        tokio::select! {
+            _ = stdin_handler => {
+                debug!("stdin_handler() exited");
+            }
+            _ = message_handler => {
+                debug!("message_handler() exited");
+            }
+        };
+
         Ok(())
     }
 }

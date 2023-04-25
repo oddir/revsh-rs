@@ -210,32 +210,36 @@ impl Message {
             _ => {}
         }
 
-        stream.write(&u16::to_be_bytes(header_len)).await?;
+        stream.write_all(&u16::to_be_bytes(header_len)).await?;
         stream
-            .write(&u8::to_be_bytes(self.data_type.value()))
+            .write_all(&u8::to_be_bytes(self.data_type.value()))
             .await?;
         stream
-            .write(&u16::to_be_bytes(self.data.len().try_into()?))
+            .write_all(&u16::to_be_bytes(self.data.len().try_into()?))
             .await?;
 
         match self.data_type {
             DataType::Proxy | DataType::Connection => {
-                stream.write(&u16::to_be_bytes(self.header_type)).await?;
-                stream.write(&u16::to_be_bytes(self.header_origin)).await?;
-                stream.write(&u16::to_be_bytes(self.header_id)).await?;
+                stream
+                    .write_all(&u16::to_be_bytes(self.header_type))
+                    .await?;
+                stream
+                    .write_all(&u16::to_be_bytes(self.header_origin))
+                    .await?;
+                stream.write_all(&u16::to_be_bytes(self.header_id)).await?;
                 if ProxyHeaderType::from(self.header_type) == ProxyHeaderType::Create
                     || ProxyHeaderType::from(self.header_type) == ProxyHeaderType::Report
                     || ConnectionHeaderType::from(self.header_type) == ConnectionHeaderType::Create
                 {
                     stream
-                        .write(&u16::to_be_bytes(self.header_proxy_type))
+                        .write_all(&u16::to_be_bytes(self.header_proxy_type))
                         .await?;
                 }
             }
             _ => {}
         }
 
-        stream.write(&self.data).await?;
+        stream.write_all(&self.data).await?;
         Ok(())
     }
 
@@ -303,5 +307,11 @@ impl Message {
         stream.read_exact(&mut message.data).await?;
 
         Ok(message)
+    }
+}
+
+impl Default for Message {
+    fn default() -> Self {
+        Self::new()
     }
 }
